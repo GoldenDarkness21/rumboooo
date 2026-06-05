@@ -7,19 +7,19 @@ import { useNavigate } from "react-router-dom";
 import {
   ArrowLeft,
   ArrowRight,
-  Plus,
-  X,
-  Loader2,
   CalendarIcon,
   Users,
   MapPin,
   DollarSign,
   FileText,
+  Loader2,
 } from "lucide-react";
 import { useTrips } from "@/context/TripContext";
-import { tripsService, itineraryService } from "@/lib/supabase";
-import type { Trip, Participant, ItineraryDay } from "@/types";
+import { tripsService, itineraryService, invitationsService, type SearchableProfile } from "@/lib/supabase";
+import type { Trip, ItineraryDay } from "@/types";
+import { useAuth } from "@/context/AuthContext";
 import { toast } from "sonner";
+import { UserSearch } from "@/components/UserSearch";
 
 const CURRENCIES = [
   { value: "COP", label: "COP – Peso colombiano" },
@@ -38,6 +38,7 @@ const steps = [
 
 const CreateTrip = () => {
   const { refreshTrips } = useTrips();
+  const { user } = useAuth();
   const navigate = useNavigate();
   const [step, setStep] = useState(1);
   const [loading, setLoading] = useState(false);
@@ -49,26 +50,12 @@ const CreateTrip = () => {
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
 
-  const [participants, setParticipants] = useState<Participant[]>([]);
-  const [newParticipant, setNewParticipant] = useState("");
-  const [newParticipantEmail, setNewParticipantEmail] = useState("");
+  // Selected users to invite (registered users from search)
+  const [selectedUsers, setSelectedUsers] = useState<SearchableProfile[]>([]);
 
   const [days, setDays] = useState<{ date: string; title: string }[]>([]);
 
   const [currency, setCurrency] = useState("COP");
-
-  const addParticipant = () => {
-    const name = newParticipant.trim();
-    const email = newParticipantEmail.trim();
-    if (name && !participants.find((p) => p.name === name)) {
-      setParticipants([
-        ...participants,
-        { id: `np-${Date.now()}`, name, email: email || undefined },
-      ]);
-      setNewParticipant("");
-      setNewParticipantEmail("");
-    }
-  };
 
   const handleDateRange = (start: string, end: string) => {
     setStartDate(start);
@@ -92,8 +79,14 @@ const CreateTrip = () => {
   };
 
   const handleCreate = async () => {
+    if (!user) {
+      toast.error("Debes iniciar sesión para crear un viaje");
+      return;
+    }
+
     setLoading(true);
     try {
+      // Create the trip
       const createdTrip = await tripsService.createTrip({
         name: tripName.trim(),
         destination: destination.trim(),
@@ -101,18 +94,38 @@ const CreateTrip = () => {
         startDate,
         endDate,
         currency,
-        participantEmails: participants
-          .map((p) => p.email)
-          .filter(Boolean) as string[],
+        participantEmails: [], // We'll add participants separately
       });
 
-      // Guardar los días del itinerario en Supabase
+      // Save itinerary days
       for (const day of days) {
         await itineraryService.createDay({
           tripId: createdTrip.id,
           date: day.date,
           title: day.title,
         });
+      }
+
+      // Invite selected users
+      if (selectedUsers.length > 0) {
+        const invitePromises = selectedUsers.map((userToInvite) =>
+          invitationsService.inviteUser(
+            createdTrip.id,
+            userToInvite.id,
+            user!.id
+          )
+        );
+        const results = await Promise.all(invitePromises);
+        const failures = results.filter((r) => !r.success);
+        if (failures.length > 0) {
+          toast.warning(
+            `${failures.length} invitación(es) no se pudieron enviar`
+          );
+        } else {
+          toast.success(
+            `${selectedUsers.length} usuarios invitados exitosamente`
+          );
+        }
       }
 
       await refreshTrips();
@@ -130,14 +143,14 @@ const CreateTrip = () => {
 
   const canAdvance1 = tripName.trim() && destination.trim();
   const canAdvance2 = startDate && endDate && endDate >= startDate;
-  const canAdvance3 = participants.length >= 2;
+  const canAdvance3 = selectedUsers.length >= 1; // At least 1 invited user (plus creator = 2)
   const canAdvance4 = true; // itinerary preview is optional
   const canCreate =
     tripName.trim() &&
     destination.trim() &&
     startDate &&
     endDate &&
-    participants.length >= 1;
+    selectedUsers.length >= 0; // Creator is always included
 
   return (
     <div className="min-h-screen bg-background">
@@ -270,88 +283,45 @@ const CreateTrip = () => {
           {step === 3 && (
             <div className="space-y-4 animate-fade-in">
               <div className="space-y-1.5">
-                <Label className="text-sm">Añadir participantes *</Label>
+                <Label className="text-sm">Invitar participantes</Label>
                 <p className="text-xs text-muted-foreground">
-                  Mínimo 2 personas para dividir gastos
+                  Busca usuarios registrados por nombre o email para invitarlos
+                  a tu viaje. Ellos recibirán una invitación que podrán aceptar
+                  o declinar.
                 </p>
-                <div className="flex gap-2">
-                  <Input
-                    placeholder="Nombre"
-                    className="h-11 rounded-lg"
-                    value={newParticipant}
-                    onChange={(e) => setNewParticipant(e.target.value)}
-                    onKeyDown={(e) =>
-                      e.key === "Enter" &&
-                      (e.preventDefault(), addParticipant())
-                    }
-                  />
-                  <Input
-                    placeholder="Email (opcional)"
-                    type="email"
-                    className="h-11 rounded-lg"
-                    value={newParticipantEmail}
-                    onChange={(e) => setNewParticipantEmail(e.target.value)}
-                    onKeyDown={(e) =>
-                      e.key === "Enter" &&
-                      (e.preventDefault(), addParticipant())
-                    }
-                  />
-                  <Button
-                    variant="outline"
-                    size="icon"
-                    className="h-11 w-11 shrink-0"
-                    onClick={addParticipant}
-                  >
-                    <Plus className="h-4 w-4" />
-                  </Button>
-                </div>
+                <UserSearch
+                  onUserSelect={(userProfile) =>
+                    setSelectedUsers([...selectedUsers, userProfile])
+                  }
+                  selectedUsers={selectedUsers}
+                  onRemoveUser={(userId) =>
+                    setSelectedUsers(selectedUsers.filter((u) => u.id !== userId))
+                  }
+                />
               </div>
 
-              {participants.length > 0 && (
-                <div className="rounded-xl border border-border bg-background p-3 space-y-2">
-                  {participants.map((p) => (
-                    <div
-                      key={p.id}
-                      className="flex items-center justify-between"
-                    >
-                      <div className="flex items-center gap-2.5">
-                        <div className="h-7 w-7 rounded-full gradient-primary flex items-center justify-center text-xs font-medium text-white">
-                          {p.name.charAt(0).toUpperCase()}
-                        </div>
-                        <div className="flex flex-col">
-                          <span className="text-sm font-medium">{p.name}</span>
-                          {p.email && (
-                            <span className="text-xs text-muted-foreground">
-                              {p.email}
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                      <button
-                        onClick={() =>
-                          setParticipants(
-                            participants.filter((x) => x.id !== p.id),
-                          )
-                        }
-                        className="text-muted-foreground hover:text-destructive transition-colors"
-                      >
-                        <X className="h-4 w-4" />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
+              <div className="rounded-xl bg-muted/50 border border-border p-3 text-sm">
+                <p className="font-medium text-foreground mb-1">
+                  ¿Cómo funciona?
+                </p>
+                <ul className="text-xs text-muted-foreground space-y-1">
+                  <li>• Los usuarios invitados recibirán una notificación</li>
+                  <li>• Podrán aceptar o declinar la invitación</li>
+                  <li>• Una vez acepten, podrán ver el viaje en su lista</li>
+                  <li>• Solo el creador podrá editar el viaje</li>
+                </ul>
+              </div>
 
               <Button
                 className="w-full"
                 size="lg"
                 onClick={() => setStep(4)}
-                disabled={!canAdvance3}
               >
                 Siguiente <ArrowRight className="h-4 w-4" />
               </Button>
             </div>
           )}
+
           {/* ── STEP 4: Itinerario preview ───────────────────────────────────── */}
           {step === 4 && (
             <div className="space-y-4 animate-fade-in">
@@ -383,7 +353,12 @@ const CreateTrip = () => {
                   ))}
                 </div>
               </div>
-              <Button className="w-full" size="lg" onClick={() => setStep(5)}>
+              <Button
+                className="w-full"
+                size="lg"
+                onClick={() => setStep(5)}
+                disabled={days.length === 0}
+              >
                 Siguiente <ArrowRight className="h-4 w-4" />
               </Button>
             </div>
@@ -447,8 +422,8 @@ const CreateTrip = () => {
                   </span>
                 </div>
                 <div className="flex justify-between text-muted-foreground">
-                  <span>Participantes</span>
-                  <span className="text-foreground">{participants.length}</span>
+                  <span>Invitados</span>
+                  <span className="text-foreground">{selectedUsers.length}</span>
                 </div>
                 <div className="flex justify-between text-muted-foreground">
                   <span>Días</span>
@@ -460,7 +435,7 @@ const CreateTrip = () => {
                 className="w-full"
                 size="lg"
                 onClick={handleCreate}
-                disabled={loading || !canCreate}
+                disabled={loading}
               >
                 {loading ? (
                   <>

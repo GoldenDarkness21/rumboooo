@@ -27,3 +27,6 @@ export type {
   CreateActivityParams,
   UpdateActivityParams,
 } from './itinerary';
+
+export { invitationsService } from './invitations';
+export type { SearchableProfile } from './invitations';

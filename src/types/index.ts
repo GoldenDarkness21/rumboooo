@@ -4,6 +4,26 @@ export interface Participant {
 	email?: string;
 }
 
+export type InvitationStatus = 'pending' | 'accepted' | 'declined';
+export type ParticipantRole = 'owner' | 'member';
+
+export interface TripParticipant {
+	id: string;
+	tripId: string;
+	userId: string;
+	role: ParticipantRole;
+	status: InvitationStatus;
+	invitedAt: string;
+	joinedAt: string;
+}
+
+export interface UserProfile {
+	id: string;
+	email: string;
+	fullName: string | null;
+	avatarUrl: string | null;
+}
+
 export type SplitMethod = 'equal' | 'percentage' | 'custom';
 
 export interface ExpenseSplit {

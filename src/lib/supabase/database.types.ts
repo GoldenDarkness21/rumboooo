@@ -79,6 +79,8 @@ export interface Database {
           trip_id: string
           user_id: string
           role: 'owner' | 'member'
+          status: 'pending' | 'accepted' | 'declined'
+          invited_at: string
           joined_at: string
         }
         Insert: {
@@ -86,6 +88,8 @@ export interface Database {
           trip_id: string
           user_id: string
           role?: 'owner' | 'member'
+          status?: 'pending' | 'accepted' | 'declined'
+          invited_at?: string
           joined_at?: string
         }
         Update: {
@@ -93,6 +97,8 @@ export interface Database {
           trip_id?: string
           user_id?: string
           role?: 'owner' | 'member'
+          status?: 'pending' | 'accepted' | 'declined'
+          invited_at?: string
           joined_at?: string
         }
       }
@@ -210,7 +216,7 @@ export interface Database {
           google_maps_url?: string | null
           place_info?: Json | null
           notes?: string | null
-          category: 'transporte' | 'alojamiento' | 'comida' | 'turismo' | 'ocio' | 'otro'
+          category?: 'transporte' | 'alojamiento' | 'comida' | 'turismo' | 'ocio' | 'otro'
           created_at?: string
         }
         Update: {
