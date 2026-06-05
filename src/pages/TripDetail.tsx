@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { Navbar } from "@/components/Navbar";
 import { AvatarGroup } from "@/components/AvatarGroup";
 import { StatusBadge } from "@/components/StatusBadge";
 import { AddExpenseModal } from "@/components/AddExpenseModal";
 import { AddActivityModal } from "@/components/AddActivityModal";
+import { AddParticipantModal } from "@/components/AddParticipantModal";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
@@ -23,13 +24,17 @@ import {
   ArrowRight,
   Info,
   AlertCircle,
+  UserPlus,
 } from "lucide-react";
 import {
   useTrips,
   computeBalances,
   computeSettlements,
 } from "@/context/TripContext";
-import type { Expense, Activity, ItineraryDay } from "@/types";
+import { useAuth } from "@/context/AuthContext";
+import { invitationsService } from "@/lib/supabase";
+import type { Expense, Activity, ItineraryDay, TripParticipant } from "@/types";
+import { toast } from "sonner";
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -79,6 +84,7 @@ const formatDuration = (min: number) => {
 const TripDetail = () => {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const { user } = useAuth();
   const {
     getTripById,
     addExpense,
@@ -90,6 +96,69 @@ const TripDetail = () => {
   } = useTrips();
 
   const trip = getTripById(id ?? "");
+
+  // Role-based permissions
+  const [isOwner, setIsOwner] = useState(false);
+  const [participants, setParticipants] = useState<TripParticipant[]>([]);
+  const [loadingParticipants, setLoadingParticipants] = useState(false);
+  const [addParticipantModalOpen, setAddParticipantModalOpen] = useState(false);
+
+  // Check if current user is owner
+  useEffect(() => {
+    if (!id || !user) return;
+
+    const checkRole = async () => {
+      setLoadingParticipants(true);
+      try {
+        const tripParticipants = await invitationsService.getTripParticipants(id);
+        setParticipants(tripParticipants);
+        const currentUserParticipant = tripParticipants.find(
+          (p) => p.userId === user.id
+        );
+        setIsOwner(currentUserParticipant?.role === 'owner');
+      } catch (error) {
+        console.error('Error checking user role:', error);
+        setIsOwner(false);
+      } finally {
+        setLoadingParticipants(false);
+      }
+    };
+
+    checkRole();
+  }, [id, user]);
+
+  // Handle adding a participant
+  const handleAddParticipant = async (userId: string) => {
+    if (!id || !user) return;
+
+    // Check for duplicates first
+    const existingParticipant = participants.find(
+      (p) => p.userId === userId
+    );
+
+    if (existingParticipant) {
+      toast.error('Este usuario ya ha sido invitado o ya forma parte del viaje.');
+      return false;
+    }
+
+    try {
+      const result = await invitationsService.inviteUser(id, userId, user.id);
+      if (result.success) {
+        toast.success('Invitación enviada exitosamente');
+        // Refresh participants list
+        const updatedParticipants = await invitationsService.getTripParticipants(id);
+        setParticipants(updatedParticipants);
+        return true;
+      } else {
+        toast.error(result.error || 'Error al enviar invitación');
+        return false;
+      }
+    } catch (error) {
+      console.error('Error inviting user:', error);
+      toast.error('Error al enviar invitación');
+      return false;
+    }
+  };
 
   // Modals
   const [expenseModalOpen, setExpenseModalOpen] = useState(false);
@@ -201,6 +270,12 @@ const TripDetail = () => {
         onSave={handleSaveActivity}
         editActivity={editingActivity?.activity ?? null}
       />
+      <AddParticipantModal
+        open={addParticipantModalOpen}
+        onClose={() => setAddParticipantModalOpen(false)}
+        onAddParticipant={handleAddParticipant}
+        existingParticipants={participants}
+      />
 
       <div className="container max-w-2xl py-8">
         {/* Back */}
@@ -236,6 +311,17 @@ const TripDetail = () => {
             <span className="text-sm text-muted-foreground">
               {trip.participants.length} participantes
             </span>
+            {isOwner && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 ml-2"
+                onClick={() => setAddParticipantModalOpen(true)}
+              >
+                <UserPlus className="h-3.5 w-3.5 mr-1" />
+                Añadir
+              </Button>
+            )}
           </div>
         </div>
 
