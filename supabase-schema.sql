@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS public.trip_participants (
   trip_id UUID NOT NULL REFERENCES public.trips(id) ON DELETE CASCADE,
   user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
   role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('owner', 'member')),
+  status TEXT NOT NULL DEFAULT 'accepted' CHECK (status IN ('pending', 'accepted', 'declined')),
+  invited_at TIMESTAMPTZ DEFAULT NOW(),
   joined_at TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE(trip_id, user_id)
 );
@@ -122,11 +124,13 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;
 DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
 CREATE TRIGGER on_auth_user_created AFTER INSERT ON auth.users FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
 
--- 9. RLS - POLÍTICAS SIMPLIFICADAS
+-- 9. RLS - POLÍTICAS CON CONTROL DE ROLES
+-- Las políticas ahora distinguen entre owner (creador) y members (invitados)
+-- Solo los owners tienen permisos de escritura, los members solo lectura
+
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.trips ENABLE ROW LEVEL SECURITY;
--- trip_participants: RLS DESACTIVADO para evitar recursión infinita
-ALTER TABLE public.trip_participants DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.trip_participants ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.expenses ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.expense_splits ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.itinerary_days ENABLE ROW LEVEL SECURITY;
@@ -139,74 +143,227 @@ CREATE POLICY "public.profiles: users can view other profiles in same trips" ON 
   EXISTS (
     SELECT 1 FROM public.trip_participants tp1
     JOIN public.trip_participants tp2 ON tp1.trip_id = tp2.trip_id
-    WHERE tp1.user_id = auth.uid() AND tp2.user_id = public.profiles.id
+    WHERE tp1.user_id = auth.uid() 
+      AND tp1.status = 'accepted'
+      AND tp2.user_id = public.profiles.id
   )
 );
 
--- TRIPS - Política simplificada para INSERT
-CREATE POLICY "public.trips: users can view trips where they are participant" ON public.trips FOR SELECT USING (
-  EXISTS (SELECT 1 FROM public.trip_participants WHERE trip_id = id AND user_id = auth.uid())
+-- TRIPS - Policies with read-only enforcement for non-owners
+CREATE POLICY "public.trips: users can view trips where they are accepted participant" ON public.trips FOR SELECT USING (
+  EXISTS (
+    SELECT 1 FROM public.trip_participants 
+    WHERE trip_id = id 
+      AND user_id = auth.uid() 
+      AND status = 'accepted'
+  )
 );
 CREATE POLICY "public.trips: users can insert own trips" ON public.trips FOR INSERT WITH CHECK (auth.uid() = user_id);
-CREATE POLICY "public.trips: users can update trips where they are owner" ON public.trips FOR UPDATE USING (
-  EXISTS (SELECT 1 FROM public.trip_participants WHERE trip_id = id AND user_id = auth.uid() AND role = 'owner')
+CREATE POLICY "public.trips: owners can update their trips" ON public.trips FOR UPDATE USING (
+  EXISTS (
+    SELECT 1 FROM public.trip_participants 
+    WHERE trip_id = id 
+      AND user_id = auth.uid() 
+      AND role = 'owner'
+  )
 );
-CREATE POLICY "public.trips: users can delete trips where they are owner" ON public.trips FOR DELETE USING (
-  EXISTS (SELECT 1 FROM public.trip_participants WHERE trip_id = id AND user_id = auth.uid() AND role = 'owner')
-);
-
--- TRIP_PARTICIPANTS - Sin RLS para evitar recursión infinita
--- Nota: El acceso se controla a través de las políticas de trips y expenses
--- Los usuarios solo pueden acceder a trip_participants a través de viajes donde participan
-
--- EXPENSES
-CREATE POLICY "public.expenses: users can view expenses in their trips" ON public.expenses FOR SELECT USING (
-  EXISTS (SELECT 1 FROM public.trip_participants WHERE trip_id = trip_id AND user_id = auth.uid())
-);
-CREATE POLICY "public.expenses: users can insert expenses in their trips" ON public.expenses FOR INSERT WITH CHECK (
-  EXISTS (SELECT 1 FROM public.trip_participants WHERE trip_id = trip_id AND user_id = auth.uid())
-);
-CREATE POLICY "public.expenses: users can update own expenses" ON public.expenses FOR UPDATE USING (auth.uid() = paid_by_id);
-CREATE POLICY "public.expenses: users can delete own expenses" ON public.expenses FOR DELETE USING (auth.uid() = paid_by_id);
-
--- EXPENSE_SPLITS
-CREATE POLICY "public.expense_splits: users can view splits in their trips" ON public.expense_splits FOR SELECT USING (
-  EXISTS (SELECT 1 FROM public.expenses e JOIN public.trip_participants tp ON e.trip_id = tp.trip_id WHERE e.id = expense_id AND tp.user_id = auth.uid())
-);
-CREATE POLICY "public.expense_splits: users can insert splits in their trips" ON public.expense_splits FOR INSERT WITH CHECK (
-  EXISTS (SELECT 1 FROM public.expenses e JOIN public.trip_participants tp ON e.trip_id = tp.trip_id WHERE e.id = expense_id AND tp.user_id = auth.uid())
-);
-CREATE POLICY "public.expense_splits: users can update splits in their trips" ON public.expense_splits FOR UPDATE USING (
-  EXISTS (SELECT 1 FROM public.expenses e JOIN public.trip_participants tp ON e.trip_id = tp.trip_id WHERE e.id = expense_id AND tp.user_id = auth.uid())
-);
-CREATE POLICY "public.expense_splits: users can delete splits in their trips" ON public.expense_splits FOR DELETE USING (
-  EXISTS (SELECT 1 FROM public.expenses e JOIN public.trip_participants tp ON e.trip_id = tp.trip_id WHERE e.id = expense_id AND tp.user_id = auth.uid())
+CREATE POLICY "public.trips: owners can delete their trips" ON public.trips FOR DELETE USING (
+  EXISTS (
+    SELECT 1 FROM public.trip_participants 
+    WHERE trip_id = id 
+      AND user_id = auth.uid() 
+      AND role = 'owner'
+  )
 );
 
--- ITINERARY_DAYS
-CREATE POLICY "public.itinerary_days: users can view days in their trips" ON public.itinerary_days FOR SELECT USING (
-  EXISTS (SELECT 1 FROM public.trip_participants WHERE trip_id = trip_id AND user_id = auth.uid())
+-- TRIP_PARTICIPANTS - Policies with read-only for non-owners
+CREATE POLICY "public.trip_participants: users can view their own participation" ON public.trip_participants FOR SELECT USING (
+  user_id = auth.uid()
 );
-CREATE POLICY "public.itinerary_days: users can insert days in their trips" ON public.itinerary_days FOR INSERT WITH CHECK (
-  EXISTS (SELECT 1 FROM public.trip_participants WHERE trip_id = trip_id AND user_id = auth.uid())
+CREATE POLICY "public.trip_participants: owners can view participants in their trips" ON public.trip_participants FOR SELECT USING (
+  EXISTS (
+    SELECT 1 FROM public.trip_participants tp
+    WHERE tp.trip_id = trip_participants.trip_id 
+      AND tp.user_id = auth.uid() 
+      AND tp.role = 'owner'
+  )
 );
-CREATE POLICY "public.itinerary_days: users can update days in their trips" ON public.itinerary_days FOR UPDATE USING (
-  EXISTS (SELECT 1 FROM public.trip_participants WHERE trip_id = trip_id AND user_id = auth.uid())
+CREATE POLICY "public.trip_participants: owners can manage participants" ON public.trip_participants FOR INSERT WITH CHECK (
+  EXISTS (
+    SELECT 1 FROM public.trip_participants tp
+    WHERE tp.trip_id = trip_participants.trip_id 
+      AND tp.user_id = auth.uid() 
+      AND tp.role = 'owner'
+  )
 );
-CREATE POLICY "public.itinerary_days: users can delete days in their trips" ON public.itinerary_days FOR DELETE USING (
-  EXISTS (SELECT 1 FROM public.trip_participants WHERE trip_id = trip_id AND user_id = auth.uid())
+CREATE POLICY "public.trip_participants: owners can update participants in their trips" ON public.trip_participants FOR UPDATE USING (
+  EXISTS (
+    SELECT 1 FROM public.trip_participants tp
+    WHERE tp.trip_id = trip_participants.trip_id 
+      AND tp.user_id = auth.uid() 
+      AND tp.role = 'owner'
+  )
+);
+CREATE POLICY "public.trip_participants: owners can remove participants from their trips" ON public.trip_participants FOR DELETE USING (
+  EXISTS (
+    SELECT 1 FROM public.trip_participants tp
+    WHERE tp.trip_id = trip_participants.trip_id 
+      AND tp.user_id = auth.uid() 
+      AND tp.role = 'owner'
+  )
+);
+CREATE POLICY "public.trip_participants: users can update their own status" ON public.trip_participants FOR UPDATE USING (
+  user_id = auth.uid()
+) WITH CHECK (
+  user_id = auth.uid() AND
+  (
+    -- Users can only update their own status (for accepting/declining invitations)
+    (status IN ('accepted', 'declined') AND joined_at IS NOT NULL) OR
+    -- Or they can update their own record to decline
+    status = 'declined'
+  )
 );
 
--- ACTIVITIES
-CREATE POLICY "public.activities: users can view activities in their trips" ON public.activities FOR SELECT USING (
-  EXISTS (SELECT 1 FROM public.itinerary_days d JOIN public.trip_participants tp ON d.trip_id = tp.trip_id WHERE d.id = day_id AND tp.user_id = auth.uid())
+-- EXPENSES - Only owners can write, all accepted participants can read
+CREATE POLICY "public.expenses: accepted participants can view expenses in their trips" ON public.expenses FOR SELECT USING (
+  EXISTS (
+    SELECT 1 FROM public.trip_participants 
+    WHERE trip_id = trip_id 
+      AND user_id = auth.uid() 
+      AND status = 'accepted'
+  )
 );
-CREATE POLICY "public.activities: users can insert activities in their trips" ON public.activities FOR INSERT WITH CHECK (
-  EXISTS (SELECT 1 FROM public.itinerary_days d JOIN public.trip_participants tp ON d.trip_id = tp.trip_id WHERE d.id = day_id AND tp.user_id = auth.uid())
+CREATE POLICY "public.expenses: only owners can insert expenses" ON public.expenses FOR INSERT WITH CHECK (
+  EXISTS (
+    SELECT 1 FROM public.trip_participants 
+    WHERE trip_id = trip_id 
+      AND user_id = auth.uid() 
+      AND role = 'owner'
+  )
 );
-CREATE POLICY "public.activities: users can update activities in their trips" ON public.activities FOR UPDATE USING (
-  EXISTS (SELECT 1 FROM public.itinerary_days d JOIN public.trip_participants tp ON d.trip_id = tp.trip_id WHERE d.id = day_id AND tp.user_id = auth.uid())
+CREATE POLICY "public.expenses: only owners can update expenses" ON public.expenses FOR UPDATE USING (
+  EXISTS (
+    SELECT 1 FROM public.trip_participants 
+    WHERE trip_id = trip_id 
+      AND user_id = auth.uid() 
+      AND role = 'owner'
+  )
 );
-CREATE POLICY "public.activities: users can delete activities in their trips" ON public.activities FOR DELETE USING (
-  EXISTS (SELECT 1 FROM public.itinerary_days d JOIN public.trip_participants tp ON d.trip_id = tp.trip_id WHERE d.id = day_id AND tp.user_id = auth.uid())
+CREATE POLICY "public.expenses: only owners can delete expenses" ON public.expenses FOR DELETE USING (
+  EXISTS (
+    SELECT 1 FROM public.trip_participants 
+    WHERE trip_id = trip_id 
+      AND user_id = auth.uid() 
+      AND role = 'owner'
+  )
+);
+
+-- EXPENSE_SPLITS - Only owners can write, all accepted participants can read
+CREATE POLICY "public.expense_splits: accepted participants can view splits in their trips" ON public.expense_splits FOR SELECT USING (
+  EXISTS (
+    SELECT 1 FROM public.expenses e 
+    JOIN public.trip_participants tp ON e.trip_id = tp.trip_id 
+    WHERE e.id = expense_id 
+      AND tp.user_id = auth.uid() 
+      AND tp.status = 'accepted'
+  )
+);
+CREATE POLICY "public.expense_splits: only owners can manage splits" ON public.expense_splits FOR INSERT WITH CHECK (
+  EXISTS (
+    SELECT 1 FROM public.expenses e 
+    JOIN public.trip_participants tp ON e.trip_id = tp.trip_id 
+    WHERE e.id = expense_id 
+      AND tp.user_id = auth.uid() 
+      AND tp.role = 'owner'
+  )
+);
+CREATE POLICY "public.expense_splits: only owners can update splits" ON public.expense_splits FOR UPDATE USING (
+  EXISTS (
+    SELECT 1 FROM public.expenses e 
+    JOIN public.trip_participants tp ON e.trip_id = tp.trip_id 
+    WHERE e.id = expense_id 
+      AND tp.user_id = auth.uid() 
+      AND tp.role = 'owner'
+  )
+);
+CREATE POLICY "public.expense_splits: only owners can delete splits" ON public.expense_splits FOR DELETE USING (
+  EXISTS (
+    SELECT 1 FROM public.expenses e 
+    JOIN public.trip_participants tp ON e.trip_id = tp.trip_id 
+    WHERE e.id = expense_id 
+      AND tp.user_id = auth.uid() 
+      AND tp.role = 'owner'
+  )
+);
+
+-- ITINERARY_DAYS - Only owners can write, all accepted participants can read
+CREATE POLICY "public.itinerary_days: accepted participants can view days in their trips" ON public.itinerary_days FOR SELECT USING (
+  EXISTS (
+    SELECT 1 FROM public.trip_participants 
+    WHERE trip_id = trip_id 
+      AND user_id = auth.uid() 
+      AND status = 'accepted'
+  )
+);
+CREATE POLICY "public.itinerary_days: only owners can insert days" ON public.itinerary_days FOR INSERT WITH CHECK (
+  EXISTS (
+    SELECT 1 FROM public.trip_participants 
+    WHERE trip_id = trip_id 
+      AND user_id = auth.uid() 
+      AND role = 'owner'
+  )
+);
+CREATE POLICY "public.itinerary_days: only owners can update days" ON public.itinerary_days FOR UPDATE USING (
+  EXISTS (
+    SELECT 1 FROM public.trip_participants 
+    WHERE trip_id = trip_id 
+      AND user_id = auth.uid() 
+      AND role = 'owner'
+  )
+);
+CREATE POLICY "public.itinerary_days: only owners can delete days" ON public.itinerary_days FOR DELETE USING (
+  EXISTS (
+    SELECT 1 FROM public.trip_participants 
+    WHERE trip_id = trip_id 
+      AND user_id = auth.uid() 
+      AND role = 'owner'
+  )
+);
+
+-- ACTIVITIES - Only owners can write, all accepted participants can read
+CREATE POLICY "public.activities: accepted participants can view activities in their trips" ON public.activities FOR SELECT USING (
+  EXISTS (
+    SELECT 1 FROM public.itinerary_days d 
+    JOIN public.trip_participants tp ON d.trip_id = tp.trip_id 
+    WHERE d.id = day_id 
+      AND tp.user_id = auth.uid() 
+      AND tp.status = 'accepted'
+  )
+);
+CREATE POLICY "public.activities: only owners can insert activities" ON public.activities FOR INSERT WITH CHECK (
+  EXISTS (
+    SELECT 1 FROM public.itinerary_days d 
+    JOIN public.trip_participants tp ON d.trip_id = tp.trip_id 
+    WHERE d.id = day_id 
+      AND tp.user_id = auth.uid() 
+      AND tp.role = 'owner'
+  )
+);
+CREATE POLICY "public.activities: only owners can update activities" ON public.activities FOR UPDATE USING (
+  EXISTS (
+    SELECT 1 FROM public.itinerary_days d 
+    JOIN public.trip_participants tp ON d.trip_id = tp.trip_id 
+    WHERE d.id = day_id 
+      AND tp.user_id = auth.uid() 
+      AND tp.role = 'owner'
+  )
+);
+CREATE POLICY "public.activities: only owners can delete activities" ON public.activities FOR DELETE USING (
+  EXISTS (
+    SELECT 1 FROM public.itinerary_days d 
+    JOIN public.trip_participants tp ON d.trip_id = tp.trip_id 
+    WHERE d.id = day_id 
+      AND tp.user_id = auth.uid() 
+      AND tp.role = 'owner'
+  )
 );
